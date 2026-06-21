@@ -1,0 +1,17 @@
+{
+  "name": "ooky-worker-template",
+  "version": "0.1.0",
+  "description": "Deployable Cloudflare Worker template for the Ooky BYO-Worker integration tier. Customer deploys this to their own Cloudflare account.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "vitest": "^3.2.4"
+  }
+}
