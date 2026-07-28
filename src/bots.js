@@ -63,7 +63,7 @@ export async function getRegistry(env, ctx) {
   }
 
   // Refresh asynchronously so we don't block the current request. Return the
-  // current (possibly stale) memory registry — the next request will use the
+  // current (possibly stale) memory registry - the next request will use the
   // refreshed list.
   ctx.waitUntil(refreshRegistry(env));
   return memoryRegistry;
@@ -88,7 +88,7 @@ async function refreshRegistry(env) {
       });
     }
   } catch {
-    // Network error — keep stale list.
+    // Network error - keep stale list.
   }
 }
 
@@ -119,4 +119,23 @@ function timeoutSignal(ms) {
     return AbortSignal.timeout(ms);
   }
   return undefined;
+}
+
+// name → category lookup for registry entries that predate the category field
+// (a stale live registry must never cause Googlebot to get distilled content).
+const DEFAULT_CATEGORY_BY_NAME = new Map(DEFAULT_BOTS.map((b) => [b.name, b.category]));
+
+/**
+ * Serving gate: only `category: "ai"` crawlers may be served the distilled
+ * cleaned-HTML artifact. "search" engines (Googlebot, Bingbot, ...) and
+ * "social" link-preview bots index or render what they fetch — the artifact
+ * replaces the page, so serving it to them would deindex the site's pages
+ * from classic search. Entries missing a category are backfilled by name;
+ * unknown names fail closed to "unknown" (served origin, never distilled).
+ * Never throws (request hot path). Mirrors packages/sdk/src/bots.js.
+ */
+export function isDistillableBot(bot) {
+  if (!bot || typeof bot !== "object") return false;
+  const category = bot.category || DEFAULT_CATEGORY_BY_NAME.get(bot.name) || "unknown";
+  return category === "ai";
 }

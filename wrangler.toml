@@ -1,12 +1,12 @@
 #:schema node_modules/wrangler/config-schema.json
-# Ooky Worker Template — deploy this to your own Cloudflare account.
+# Ooky Worker Template - deploy this to your own Cloudflare account.
 #
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ STEP 1 (REQUIRED): WIRE THE ROUTES.                                        │
 # │                                                                            │
 # │ A `wrangler deploy` with the `routes` block below still commented out     │
 # │ does NOT intercept your site. It deploys to a *.workers.dev URL bound to   │
-# │ ZERO of your routes — a silent no-op. Your AI manifest endpoints and bot   │
+# │ ZERO of your routes - a silent no-op. Your AI manifest endpoints and bot   │
 # │ analytics will never see real traffic, even though the deploy "succeeds"   │
 # │ and the Ooky dashboard may flip to "Connected".                            │
 # │                                                                            │
@@ -16,21 +16,21 @@
 # Before deploying:
 #   1. Uncomment the `routes` block below and set it to your domain. (REQUIRED)
 #   2. Set OOKY_DOMAIN below to your registered Ooky domain (replace
-#      "YOUR_DOMAIN" — leaving the placeholder makes all manifest paths fail).
+#      "YOUR_DOMAIN" - leaving the placeholder makes all manifest paths fail).
 #   3. Set the OOKY_API_KEY secret:
 #        wrangler secret put OOKY_API_KEY   # paste your ooky_sk_* token
 #   4. (Optional) Bind the OOKY_BOT_CACHE KV namespace for cross-request bot UA
 #      caching. Without it, each isolate uses an in-memory registry.
 #   5. Run `wrangler deploy`.
 #
-# After deploying, curl https://your-domain.com/__ooky/health — it self-checks
+# After deploying, curl https://your-domain.com/__ooky/health - it self-checks
 # the routes/domain/key config and tells you exactly what (if anything) is wrong.
 
 name = "ooky-worker"
 main = "src/index.js"
 compatibility_date = "2026-04-01"
 
-# Don't publish a *.workers.dev URL — this Worker is only useful bound to your
+# Don't publish a *.workers.dev URL - this Worker is only useful bound to your
 # domain's routes (see STEP 1). Disabling it removes the silent-no-op trap.
 workers_dev = false
 
@@ -44,14 +44,14 @@ workers_dev = false
 # Vars are set on every deploy and can be edited in the Cloudflare dashboard.
 [vars]
 # REQUIRED: the domain registered in your Ooky dashboard. Replace the
-# placeholder — the Worker treats the literal "YOUR_DOMAIN" as unconfigured and
+# placeholder - the Worker treats the literal "YOUR_DOMAIN" as unconfigured and
 # returns a loud error on the manifest paths instead of silently 404ing.
 OOKY_DOMAIN = "YOUR_DOMAIN"
 # Override only if you self-host Ooky.
 OOKY_API_BASE = "https://api.ooky.ai/api"
 
-# Secrets — set via `wrangler secret put OOKY_API_KEY`.
-# Do NOT put the API key in [vars] — it would land in source control.
+# Secrets - set via `wrangler secret put OOKY_API_KEY`.
+# Do NOT put the API key in [vars] - it would land in source control.
 
 # Optional KV namespace for caching the bot registry between requests.
 # Create one with `wrangler kv namespace create OOKY_BOT_CACHE`, then paste

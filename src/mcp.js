@@ -9,7 +9,7 @@
  *
  * Real MCP clients (Claude, MCP Inspector, ChatGPT connectors) speak JSON-RPC
  * over streamable HTTP: initialize → notifications/initialized → tools/list →
- * tools/call. This module implements the stateless subset — each POST is
+ * tools/call. This module implements the stateless subset - each POST is
  * handled independently with a single JSON response per request.
  */
 
@@ -26,7 +26,7 @@ const INTERNAL_ERROR = -32603;
 export class McpToolError extends Error {}
 
 // Tool surface for the MCP server. The BYO-Worker tier exposes get_brand_info
-// only (product tools need feed data this tier doesn't have) — keep in sync
+// only (product tools need feed data this tier doesn't have) - keep in sync
 // with the descriptor served by backend public_manifest.js and the SDK.
 const MCP_TOOLS = [
   {
@@ -78,7 +78,7 @@ export async function handleMcpJsonRpc(message, server) {
     return { status: 202, body: null };
   }
   if (isNotification) {
-    // Requests we'd have to answer but can't address — accept and drop.
+    // Requests we'd have to answer but can't address - accept and drop.
     return { status: 202, body: null };
   }
 
@@ -132,10 +132,10 @@ export async function handleMcpJsonRpc(message, server) {
  * Handle an MCP request to /mcp or /.well-known/mcp.
  *
  * Speaks two protocols:
- *  - Standard MCP — JSON-RPC 2.0 over streamable HTTP (initialize, tools/list,
+ *  - Standard MCP - JSON-RPC 2.0 over streamable HTTP (initialize, tools/list,
  *    tools/call). Detected by `jsonrpc: "2.0"` on the body (or a null body from
  *    a JSON parse failure, which becomes a JSON-RPC parse error).
- *  - Legacy Ooky protocol — { tool, arguments } → { result }.
+ *  - Legacy Ooky protocol - { tool, arguments } → { result }.
  *
  * @param {unknown} body        Parsed request body, or null when JSON parsing failed.
  * @param {object}  opts
@@ -188,7 +188,7 @@ export async function handleMcpInvocation(body, opts) {
 }
 
 /**
- * Section filter for get_brand_info — mirrors the SDK/worker getBrandInfo
+ * Section filter for get_brand_info - mirrors the SDK/worker getBrandInfo
  * switch. When a section's keys are absent in the public manifest, fall back
  * to the full manifest rather than returning an empty object.
  */

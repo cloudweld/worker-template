@@ -1,17 +1,28 @@
 # Ooky Worker Template
 
-Deployable Cloudflare Worker for the **BYO Cloudflare** integration tier. Customers deploy this to their own Cloudflare account, paste their Ooky API key, and traffic for their domain is intercepted at the edge — no DNS change to a vendor zone.
+Deployable Cloudflare Worker for the **BYO Cloudflare** integration tier. Customers deploy this to their own Cloudflare account, paste their Ooky API key, and traffic for their domain is intercepted at the edge - no DNS change to a vendor zone.
 
-This is a **template repo**. The "Deploy to Cloudflare" button in the Ooky dashboard points at `https://github.com/cloudweld/worker-template`, which is this directory pushed to its own repo.
+This is a **template repo** (this directory pushed to `https://github.com/cloudweld/worker-template`).
+
+> **Most customers never need this.** The Ooky dashboard deploys this Worker into
+> your Cloudflare account for you: you paste one pre-scoped API token and Ooky
+> uploads the script, sets the `OOKY_API_KEY` secret, and binds your route. Use
+> the manual steps below only if you want to self-manage the deploy, or your
+> Cloudflare account won't let you mint an API token.
+>
+> The dashboard uploads a **bundled** build of `src/`, produced by
+> `npm run bundle` and committed at `backend/src/assets/worker-bundle/`. Change
+> anything in `src/` and you must re-run that command and commit the result, or
+> `__tests__/bundleParity.test.mjs` fails.
 
 ---
 
-## ⚠️ STEP 1 (REQUIRED): wire the routes — do this BEFORE anything else
+## ⚠️ STEP 1 (REQUIRED): wire the routes - do this BEFORE anything else
 
 A Worker only intercepts your site if it's **bound to your domain's routes**. A
 plain `wrangler deploy` (or the one-click button) with the `routes` block still
 commented out deploys the Worker to a `*.workers.dev` URL bound to **zero of
-your routes** — it never sees real traffic. The deploy "succeeds" and the Ooky
+your routes** - it never sees real traffic. The deploy "succeeds" and the Ooky
 dashboard may even flip to "Connected", but every AI manifest endpoint and all
 bot analytics are silently dead.
 
@@ -24,7 +35,7 @@ bot analytics are silently dead.
    ]
    ```
 2. Set `OOKY_DOMAIN` in `[vars]` to your registered Ooky domain (replace the
-   `YOUR_DOMAIN` placeholder — the Worker treats the literal placeholder as
+   `YOUR_DOMAIN` placeholder - the Worker treats the literal placeholder as
    unconfigured and returns a loud error instead of silently failing).
 
 > **The one-click "Deploy to Cloudflare" button is NOT sufficient on its own.**
@@ -68,7 +79,7 @@ npx wrangler deploy
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudweld/worker-template)
 
 The button scaffolds the Worker into your account but **does not wire your
-routes** — you must still complete STEP 1 (uncomment `routes`, set
+routes** - you must still complete STEP 1 (uncomment `routes`, set
 `OOKY_DOMAIN`) or the Worker intercepts nothing.
 
 ## What the Worker does
@@ -93,7 +104,14 @@ For every request to your domain:
    - `/agents.md`
    - `/.well-known/ai-manifest.json` (and `/ai-manifest.json`)
    - `/.well-known/mcp` and `/mcp` (full MCP JSON-RPC, see below)
-5. Otherwise, the request passes through to your origin unchanged.
+5. If the request is a **bot on a content page** (a `GET` that wants HTML, not an
+   asset) and you've enabled cleaned-HTML serving for the domain in the Ooky
+   dashboard, the Worker fetches the published, parity-gated **distilled HTML**
+   for that path from Ooky's bearer-authed per-page API and serves it in place of
+   your origin markup (`X-Robots-Tag: noindex`). When the feature is off or
+   nothing is published the API returns `204` and the request falls through to
+   your origin. Humans always get your real page.
+6. Otherwise, the request passes through to your origin unchanged.
 
 ### MCP support
 
@@ -109,7 +127,7 @@ clients (Claude, the MCP Inspector, ChatGPT connectors) use:
 This tier exposes only `get_brand_info` (product/feed tools require feed data
 this tier doesn't have).
 
-## What this tier does — and does NOT do (vs Full-DNS)
+## What this tier does - and does NOT do (vs Full-DNS)
 
 The BYO-Worker tier intercepts bots, fires analytics, and serves the well-known
 AI artifacts. It is intentionally simpler than the **Full-DNS** tier (where you
@@ -121,17 +139,19 @@ point your domain's DNS at Ooky):
 | AI-referral attribution (human from ChatGPT/…) | ✅ | ✅ |
 | Serve `/llms.txt`, `/llms-full.txt`, `/agents.md`, AI manifest | ✅ | ✅ |
 | MCP JSON-RPC endpoint (`get_brand_info`) | ✅ | ✅ (+ product tools) |
-| **Distilled / cleaned-HTML served to bots on normal pages** | ❌ | ✅ |
-| **JSON-LD injection into bot responses** | ❌ | ✅ |
+| **Distilled / cleaned-HTML served to bots on normal pages** | ✅ (enable per-domain) | ✅ |
+| **JSON-LD injection into your human HTML** | ❌ | ✅ |
 | **Content negotiation rewrite of your human HTML** | ❌ | ✅ |
 | Reverse-DNS / IP-CIDR bot *verification* | ❌ (UA-only) | ✅ |
 
-**Important:** on this tier, a bot hitting a *normal page* (e.g. `/products`)
-gets your **origin's HTML unchanged** — the Worker does not rewrite it or inject
-distilled content or JSON-LD. Those are Full-DNS differentiators (they require
-Ooky to sit inline in front of every request and serve the parity-gated cleaned
-HTML/JSON-LD artifacts, which aren't exposed to this tier). If you need bots to
-receive distilled HTML on every page, use the Full-DNS integration.
+**Important:** cleaned-HTML serving on this tier is **opt-in per domain** in the
+Ooky dashboard and is fetched from Ooky's per-page API (a customer-deployed
+Worker has no R2 binding, so it reads the artifact over HTTP rather than from the
+edge store the managed Worker uses). When the feature is off, or a page has
+nothing published, a bot hitting a *normal page* gets your **origin's HTML
+unchanged**. JSON-LD injection into *human* pages and content-negotiation
+rewrites remain Full-DNS differentiators; they require Ooky inline in front of
+every request.
 
 ## Resilience
 
@@ -141,7 +161,7 @@ receive distilled HTML on every page, use the Full-DNS integration.
 - **Stale-serve:** the last successful manifest per kind is kept in memory and
   served if a later fetch returns a 5xx or times out, so a transient Ooky outage
   doesn't break `/llms.txt` for crawlers. (A genuine pre-publish `404` is *not*
-  masked — it propagates so you know to publish.)
+  masked - it propagates so you know to publish.)
 - **No error caching:** the edge cache only stores 2xx responses, so a
   pre-publish 404 won't stick for 5 minutes after you publish.
 
@@ -158,7 +178,7 @@ receive distilled HTML on every page, use the Full-DNS integration.
 ## Verifying the deploy
 
 ```bash
-# Self-diagnostic — checks routes/domain/key wiring and tells you what's wrong:
+# Self-diagnostic - checks routes/domain/key wiring and tells you what's wrong:
 curl -s https://your-domain.com/__ooky/health | jq
 
 # Bot path + a manifest path:
@@ -174,7 +194,7 @@ Within ~30 seconds the integration in your Ooky dashboard should flip to
 | Symptom | Likely cause |
 |---|---|
 | `/llms.txt` returns origin's response | Worker route not bound to your domain. Complete STEP 1 (uncomment `routes`). Run `/__ooky/health` to confirm. |
-| `/__ooky/health` reports `served_on_workers_dev: true` | You're hitting the `*.workers.dev` URL — the `routes` block isn't wired. |
+| `/__ooky/health` reports `served_on_workers_dev: true` | You're hitting the `*.workers.dev` URL - the `routes` block isn't wired. |
 | Manifest endpoint returns a loud 500 about `YOUR_DOMAIN` | `OOKY_DOMAIN` is still the placeholder. Set it in `wrangler.toml` and redeploy. |
 | Manifest endpoint returns 404 | No published manifest yet. Publish from the Ooky dashboard's Builder. |
 | `[ooky] ingest responded 401` in `wrangler tail` | `OOKY_API_KEY` secret missing or wrong. Re-run `wrangler secret put OOKY_API_KEY`. |
@@ -187,6 +207,33 @@ npm install
 npm test                       # vitest unit tests
 npx wrangler deploy --dry-run  # validate the config without deploying
 ```
+
+## Changelog
+
+### 0.1.0
+
+Initial release of the BYO-Worker template (`TEMPLATE_VERSION = "0.1.0"`).
+
+- **Bot detection** against the Ooky UA registry (`/api/public/bots`), cached
+  in-memory per isolate and optionally in KV (`OOKY_BOT_CACHE`).
+- **Manifest serving** of the well-known AI URLs (`/llms.txt`, `/llms-full.txt`,
+  `/agents.md`, `/.well-known/ai-manifest.json`, `/ai-manifest.json`) from Ooky's
+  public CDN.
+- **Cleaned-HTML serving** to detected bots on content pages (opt-in per domain),
+  fetched from Ooky's bearer-authed per-page API.
+- **Event logging:** non-blocking bot events and `ai_referral` events fired to
+  Ooky's ingest endpoint with the per-domain Bearer token.
+- **MCP endpoint** (`/mcp`, `/.well-known/mcp`): JSON-RPC 2.0 (`initialize`,
+  `tools/list`, `tools/call` for `get_brand_info`) plus the legacy Ooky shape.
+- **Health endpoint** (`/__ooky/health`): self-diagnostic that reports route,
+  domain, and key wiring and flags the `*.workers.dev` no-op trap.
+- **Stale-serve resilience:** timeouts on every upstream fetch, last-good
+  manifest served through a transient 5xx/timeout, and no caching of error
+  responses.
+
+The `compatibility_date` in `wrangler.toml` is pinned to `2026-04-01` so the
+Workers runtime behaviour stays fixed for this release; bump it deliberately when
+adopting newer runtime semantics.
 
 ## License
 
