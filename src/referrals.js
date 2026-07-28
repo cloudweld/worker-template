@@ -1,5 +1,5 @@
 /**
- * AI referrer detection — identifies humans arriving from AI platforms by
+ * AI referrer detection - identifies humans arriving from AI platforms by
  * Referer header or utm_source. Self-contained copy of worker/src/referrals.js
  * (the template must not import from other packages at runtime). When you add a
  * platform to one, add it to the other to keep the tiers in parity.

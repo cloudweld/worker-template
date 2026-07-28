@@ -8,10 +8,12 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "bundle": "node scripts/bundle.mjs",
     "test": "vitest run"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0",
-    "vitest": "^3.2.4"
+    "esbuild": "^0.27.7",
+    "wrangler": "^4.110.0",
+    "vitest": "^4.1.10"
   }
 }

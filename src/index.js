@@ -1,5 +1,5 @@
 /**
- * Ooky Worker Template — deploy to your own Cloudflare account.
+ * Ooky Worker Template - deploy to your own Cloudflare account.
  *
  * For every request to your domain:
  *   - Detects AI bots by User-Agent and fires a non-blocking bot event.
@@ -10,13 +10,13 @@
  *   - Passes all other traffic through to your origin unchanged.
  *
  * What this tier does NOT do (those are Full-DNS-tier differentiators):
- *   - It does not rewrite your human HTML or inject JSON-LD for bots — bots
+ *   - It does not rewrite your human HTML or inject JSON-LD for bots - bots
  *     hitting normal pages get your origin's response, not a distilled doc.
  *   - It does not do IP-CIDR / reverse-DNS bot verification (UA-only).
  *   See the README "What this tier does and does NOT do" section.
  */
 
-import { detectBot, getRegistry } from "./bots.js";
+import { detectBot, getRegistry, isDistillableBot } from "./bots.js";
 import { detectAIReferral } from "./referrals.js";
 import { handleMcpInvocation, filterBrandSection, McpToolError } from "./mcp.js";
 
@@ -76,15 +76,61 @@ function timeoutSignal(ms) {
   return undefined;
 }
 
+// ─── Per-page cleaned-HTML serving (the takeover) ──────────────────────────
+// A detected bot on a content page is served the published, parity-gated
+// "cleaned HTML" for that path in place of origin - the same distillation the
+// managed edge Worker serves. A customer-deployed Worker has no R2 binding, so
+// it reads the artifact from Ooky's bearer-authed per-page API instead (the
+// same source the SDK and WordPress plugin use). Humans always pass through.
+
+// Asset / non-document paths never get the takeover. Mirrors @ooky/sdk.
+const ASSET_PATH_RE =
+  /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|svg|webp|avif|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mov|mp3|wav|ogg|pdf|zip|gz|tgz|rar|json|xml|rss|atom|txt|wasm|csv|webmanifest)$/i;
+
+function isAssetPath(path) {
+  if (typeof path !== "string") return false;
+  const clean = path.split("?")[0].split("#")[0];
+  return ASSET_PATH_RE.test(clean);
+}
+
+// Empty/absent Accept counts as "wants HTML" (common for AI crawlers).
+function acceptWantsHtml(accept) {
+  const a = (typeof accept === "string" ? accept : "").toLowerCase();
+  if (a === "") return true;
+  return a.includes("text/html") || a.includes("*/*");
+}
+
+/**
+ * Fetch the published cleaned HTML for a content path from Ooky's bearer-authed
+ * per-page API. Returns the HTML string, or null when there's nothing to serve
+ * (feature off / nothing published → 204, missing key, or any failure). Never
+ * throws - a fetch problem must fall through to the customer's origin.
+ */
+async function fetchCleanedHtml(path, env) {
+  if (!env.OOKY_API_KEY) return null;
+  const url = `${env.OOKY_API_BASE}/public/page/cleaned-html?path=${encodeURIComponent(path)}`;
+  try {
+    const upstream = await fetch(url, {
+      headers: { Authorization: `Bearer ${env.OOKY_API_KEY}` },
+      signal: timeoutSignal(8000),
+    });
+    if (upstream.status !== 200) return null; // 204 = feature off / nothing published
+    const html = await upstream.text();
+    return html && html.length > 0 ? html : null;
+  } catch {
+    return null; // network/timeout → origin passthrough
+  }
+}
+
 /**
  * Fetch a manifest kind from Ooky's public CDN.
- * Returns { ok, status, body, contentType } — never throws.
+ * Returns { ok, status, body, contentType } - never throws.
  */
 async function fetchManifest(kind, env) {
   const url = `${env.OOKY_API_BASE}/public/manifest/${encodeURIComponent(env.OOKY_DOMAIN)}/${kind}`;
   try {
     const upstream = await fetch(url, {
-      // Don't cache error responses at the edge — a pre-publish 404 must not
+      // Don't cache error responses at the edge - a pre-publish 404 must not
       // stick for 5 minutes after the customer publishes. Only 2xx is cached.
       cf: { cacheTtlByStatus: { "200-299": 300, "404": 0, "500-599": 0 } },
       signal: timeoutSignal(8000),
@@ -97,7 +143,7 @@ async function fetchManifest(kind, env) {
       contentType: upstream.headers.get("content-type") || CONTENT_TYPE[kind],
     };
   } catch (err) {
-    // Timeout / network error — signalled as a synthetic 5xx so the caller
+    // Timeout / network error - signalled as a synthetic 5xx so the caller
     // can fall back to the last-good cache.
     return { ok: false, status: 599, body: null, contentType: null, error: err };
   }
@@ -135,7 +181,7 @@ async function serveManifest(kind, env) {
     }
   }
 
-  // No stale copy (or a 4xx like a pre-publish 404) — propagate the status.
+  // No stale copy (or a 4xx like a pre-publish 404) - propagate the status.
   return new Response(`Manifest unavailable (${result.status})`, {
     status: result.status,
     headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -229,7 +275,7 @@ function misconfiguredManifestResponse() {
 
 /**
  * Runtime self-diagnostic. A clean `wrangler deploy` with no `routes` block
- * binds the Worker to *.workers.dev only — bound to ZERO of the customer's
+ * binds the Worker to *.workers.dev only - bound to ZERO of the customer's
  * routes, so it's a silent no-op for real traffic even though the Cloudflare
  * dashboard reports a successful deploy. We can detect that the request host
  * isn't the configured domain and explain it instead of failing silently.
@@ -245,7 +291,7 @@ function healthResponse(url, env) {
     problems.push(
       "This Worker is being served on *.workers.dev, NOT your domain. A clean " +
         "`wrangler deploy` with no `routes` block (or the one-click button on " +
-        "its own) does NOT bind the Worker to your site — it deploys to " +
+        "its own) does NOT bind the Worker to your site - it deploys to " +
         "*.workers.dev bound to zero customer routes, so it never sees real " +
         "traffic. Uncomment the `routes` block in wrangler.toml, set it to your " +
         "domain, and redeploy."
@@ -283,7 +329,7 @@ function healthResponse(url, env) {
     routes_wired: hostMatchesDomain,
     problems,
     next_steps: problems.length
-      ? "Fix the problems above. The most common one is missing `routes` config — " +
+      ? "Fix the problems above. The most common one is missing `routes` config - " +
         "see the README STEP 1."
       : "Healthy: this Worker is bound to your domain and configured.",
   };
@@ -300,7 +346,7 @@ function healthResponse(url, env) {
 
 function recordEvent(env, payload) {
   // Events need the ooky_sk_* token. If it isn't set, analytics are simply
-  // disabled — manifest serving still works on OOKY_DOMAIN alone. No-op
+  // disabled - manifest serving still works on OOKY_DOMAIN alone. No-op
   // (avoids a pointless `Bearer undefined` POST that would 401).
   if (!env.OOKY_API_KEY) return Promise.resolve();
   // Fire-and-forget. The request handler keeps this alive past the response
@@ -325,7 +371,7 @@ function recordEvent(env, payload) {
       return res;
     })
     .catch(() => {
-      // Best-effort — never throw on the request path.
+      // Best-effort - never throw on the request path.
     });
 }
 
@@ -333,7 +379,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Self-diagnostic endpoint — always available, even when misconfigured,
+    // Self-diagnostic endpoint - always available, even when misconfigured,
     // so a customer can curl it to find out why the integration looks dead.
     if (url.pathname === "/__ooky/health") {
       return healthResponse(url, env);
@@ -341,12 +387,12 @@ export default {
 
     // Manifest serving only needs OOKY_DOMAIN; the API key only gates event
     // analytics (recordEvent no-ops without it). So gate the loud-500 on the
-    // DOMAIN alone — a domain-configured Worker still serves AI artifacts even
+    // DOMAIN alone - a domain-configured Worker still serves AI artifacts even
     // if the key is missing, rather than 500ing them.
     if (!isDomainConfigured(env)) {
       // Domain unconfigured. Human traffic must keep working, so pass normal
       // requests through. But the AI manifest paths can NOT work without a real
-      // OOKY_DOMAIN — a silent 404 there makes the dashboard look "Connected"
+      // OOKY_DOMAIN - a silent 404 there makes the dashboard look "Connected"
       // while every AI artifact is broken, so be loud on exactly those paths.
       const kind = matchPath(url.pathname);
       if (kind) return misconfiguredManifestResponse();
@@ -360,7 +406,7 @@ export default {
     const bot = detectBot(ua, registry);
 
     if (bot) {
-      // verified=false — UA-only matching cannot prove bot identity. The
+      // verified=false - UA-only matching cannot prove bot identity. The
       // Ooky-hosted Worker (Full DNS tier) does IP-CIDR + reverse-DNS via
       // CF-Connecting-IP; a customer-deployed Worker doesn't have that
       // verification surface. The backend also enforces this server-side under
@@ -407,6 +453,36 @@ export default {
     }
     if (kind) {
       return serveManifest(kind, env);
+    }
+
+    // Content page (not a well-known path). A detected AI bot is served the
+    // distilled cleaned HTML in place of origin, if one is published; humans
+    // always get the real page. Search/social crawlers (category !== "ai")
+    // are excluded — the artifact replaces the page, so serving it to
+    // Googlebot/Bingbot/link-preview bots would deindex the site; they fall
+    // through to origin like a human (still logged above). Eligibility
+    // mirrors the SDK + managed Worker: GET document navigations only, never
+    // assets or non-HTML clients. The per-page API returns 204 when the
+    // feature is off or nothing is published, so fetchCleanedHtml yields null
+    // and we fall straight through to origin.
+    if (bot && isDistillableBot(bot)) {
+      const eligible =
+        request.method === "GET" &&
+        acceptWantsHtml(request.headers.get("accept")) &&
+        !isAssetPath(url.pathname);
+      if (eligible) {
+        const cleaned = await fetchCleanedHtml(url.pathname || "/", env);
+        if (cleaned) {
+          return new Response(cleaned, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "public, max-age=3600",
+              "X-Ooky-CleanedHtml": "1",
+            },
+          });
+        }
+      }
     }
 
     return fetch(request);
