@@ -41,6 +41,7 @@ export const DEFAULT_BOTS = [
 
 const KV_KEY = "ooky:bot_registry";
 const KV_TTL_S = 3600;
+export const MAX_BOT_REGISTRY_ENTRIES = 2000;
 
 let memoryRegistry = DEFAULT_BOTS;
 let memoryExpiresAt = 0;
@@ -55,10 +56,11 @@ export async function getRegistry(env, ctx) {
 
   if (env.OOKY_BOT_CACHE) {
     const cached = await env.OOKY_BOT_CACHE.get(KV_KEY, "json");
-    if (Array.isArray(cached) && cached.length > 0) {
-      memoryRegistry = cached;
+    const cleaned = sanitizeBotRegistry(cached);
+    if (cleaned && cleaned.length > 0) {
+      memoryRegistry = cleaned;
       memoryExpiresAt = Date.now() + MEMORY_TTL_MS;
-      return cached;
+      return cleaned;
     }
   }
 
@@ -79,11 +81,12 @@ async function refreshRegistry(env) {
     });
     if (!res.ok) return;
     const data = await res.json();
-    if (!Array.isArray(data?.bots) || data.bots.length === 0) return;
-    memoryRegistry = data.bots;
+    const cleaned = sanitizeBotRegistry(data?.bots);
+    if (!cleaned || cleaned.length === 0) return;
+    memoryRegistry = cleaned;
     memoryExpiresAt = Date.now() + MEMORY_TTL_MS;
     if (env.OOKY_BOT_CACHE) {
-      await env.OOKY_BOT_CACHE.put(KV_KEY, JSON.stringify(data.bots), {
+      await env.OOKY_BOT_CACHE.put(KV_KEY, JSON.stringify(cleaned), {
         expirationTtl: KV_TTL_S,
       });
     }
@@ -102,11 +105,30 @@ export function detectBot(userAgent, registry) {
   if (!userAgent || typeof userAgent !== "string") return null;
   if (!Array.isArray(registry)) return null;
   const ua = userAgent.toLowerCase();
-  for (const b of registry) {
+  const limit = Math.min(registry.length, MAX_BOT_REGISTRY_ENTRIES);
+  for (let i = 0; i < limit; i++) {
+    const b = registry[i];
     if (!b || typeof b.pattern !== "string" || b.pattern.length === 0) continue;
     if (ua.includes(b.pattern.toLowerCase())) return b;
   }
   return null;
+}
+
+/**
+ * Validate and cap any live/KV registry before adopting it. This runs at the
+ * trust boundary so a corrupt or oversized public payload cannot turn every
+ * customer request into an unbounded scan or an empty-pattern match.
+ */
+export function sanitizeBotRegistry(input) {
+  if (!Array.isArray(input)) return null;
+  const out = [];
+  for (const bot of input) {
+    if (out.length >= MAX_BOT_REGISTRY_ENTRIES) break;
+    if (!bot || typeof bot !== "object") continue;
+    if (typeof bot.pattern !== "string" || bot.pattern.length === 0) continue;
+    out.push(bot);
+  }
+  return out;
 }
 
 /**
