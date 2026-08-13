@@ -21,12 +21,21 @@
 #        wrangler secret put OOKY_API_KEY   # paste your ooky_sk_* token
 #   4. (Optional) Bind the OOKY_BOT_CACHE KV namespace for cross-request bot UA
 #      caching. Without it, each isolate uses an in-memory registry.
-#   5. Run `wrangler deploy`.
+#   5. Give this hostname its own Worker name (see `name` below), then run
+#      `wrangler deploy`. Never reuse one script name across domain routes.
 #
 # After deploying, curl https://your-domain.com/__ooky/health - it self-checks
 # the routes/domain/key config and tells you exactly what (if anything) is wrong.
 
-name = "ooky-worker"
+# REQUIRED: replace this with a per-host name before deploying. Include a
+# short random/hash suffix so punctuation-normalized hostnames cannot collide,
+# e.g. `ooky-example-com-a13f09c2`. Reusing the old account-global
+# `ooky-worker` name lets a later deploy replace the code and secrets behind
+# every older route that points at it.
+# Lowercase and dashes only — Cloudflare rejects anything else, so the
+# placeholder has to be a legal name or `wrangler deploy --dry-run` fails
+# before it ever validates the code a customer is about to ship.
+name = "ooky-replace-with-your-host-0000"
 main = "src/index.js"
 compatibility_date = "2026-04-01"
 
