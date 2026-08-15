@@ -37,6 +37,12 @@ bot analytics are silently dead.
 2. Set `OOKY_DOMAIN` in `[vars]` to your registered Ooky domain (replace the
    `YOUR_DOMAIN` placeholder - the Worker treats the literal placeholder as
    unconfigured and returns a loud error instead of silently failing).
+3. Set the top-level Worker `name` to a unique value for this hostname, with a
+   short random or hash suffix, for example `ooky-example-com-a13f09c2`.
+   Never reuse the old account-global `ooky-worker` name across domains: a
+   later deploy would replace the code and secrets behind every route that
+   points to it. The runtime also verifies the request hostname and passes a
+   mismatched legacy route straight through to its origin.
 
 > **The one-click "Deploy to Cloudflare" button is NOT sufficient on its own.**
 > It scaffolds the Worker but cannot wire your routes for you. After clicking it
@@ -61,7 +67,8 @@ git clone https://github.com/cloudweld/worker-template.git
 cd worker-template
 npm install
 
-# STEP 1 (REQUIRED): set OOKY_DOMAIN and uncomment the `routes` block.
+# STEP 1 (REQUIRED): set OOKY_DOMAIN, choose a unique per-host `name`, and
+# uncomment the `routes` block.
 $EDITOR wrangler.toml
 
 # Set the Bearer token (from your Ooky dashboard → Integrations → Worker)
@@ -84,18 +91,19 @@ routes** - you must still complete STEP 1 (uncomment `routes`, set
 
 ## What the Worker does
 
-For every request to your domain:
+For each request that reaches the bound route, the template runs this decision flow:
 
 1. Loads the bot-UA registry from `/api/public/bots`. By default this is cached
    **in memory per isolate** (each new isolate refetches on its first request).
    If you bind the optional `OOKY_BOT_CACHE` KV namespace, it's also cached in
    KV for an hour so isolates share it.
-2. Checks the `User-Agent` against the registry. If it's a known AI bot, fires a
-   non-blocking bot event to Ooky's ingest endpoint with your per-domain Bearer
-   token (and the request's `cf.country` for geo).
+2. Checks the `User-Agent` against the registry. If it's a known AI bot, attempts
+   a non-blocking bot event to Ooky's ingest endpoint with your per-domain Bearer
+   token (and the request's `cf.country` for geo). This delivery is best-effort,
+   so the resulting event feed is not a complete request log.
 3. For non-bot traffic, detects humans arriving from an AI platform
    (ChatGPT/Perplexity/Claude/…) via the `Referer` header or a `utm_source`
-   param, and fires a non-blocking `ai_referral` event so the dashboard's
+   param, and attempts a non-blocking `ai_referral` event so the dashboard's
    attribution lands.
 4. If the path matches one of the well-known AI URLs, serves the manifest from
    Ooky's public CDN:
@@ -105,11 +113,9 @@ For every request to your domain:
    - `/.well-known/ai-manifest.json` (and `/ai-manifest.json`)
    - `/.well-known/mcp` and `/mcp` (full MCP JSON-RPC, see below)
 5. If the request is a **bot on a content page** (a `GET` that wants HTML, not an
-   asset) and you've enabled cleaned-HTML serving for the domain in the Ooky
-   dashboard, the Worker fetches the published, parity-gated **distilled HTML**
+   asset), the Worker fetches the latest published, parity-gated **distilled HTML**
    for that path from Ooky's bearer-authed per-page API and serves it in place of
-   your origin markup (`X-Robots-Tag: noindex`). When the feature is off or
-   nothing is published the API returns `204` and the request falls through to
+   your origin markup. When nothing is published the API returns `204` and the request falls through to
    your origin. Humans always get your real page.
 6. Otherwise, the request passes through to your origin unchanged.
 
@@ -139,16 +145,16 @@ point your domain's DNS at Ooky):
 | AI-referral attribution (human from ChatGPT/…) | ✅ | ✅ |
 | Serve `/llms.txt`, `/llms-full.txt`, `/agents.md`, AI manifest | ✅ | ✅ |
 | MCP JSON-RPC endpoint (`get_brand_info`) | ✅ | ✅ (+ product tools) |
-| **Distilled / cleaned-HTML served to bots on normal pages** | ✅ (enable per-domain) | ✅ |
+| **Distilled / cleaned-HTML served to bots on normal pages** | ✅ (when published) | ✅ |
 | **JSON-LD injection into your human HTML** | ❌ | ✅ |
 | **Content negotiation rewrite of your human HTML** | ❌ | ✅ |
 | Reverse-DNS / IP-CIDR bot *verification* | ❌ (UA-only) | ✅ |
 
-**Important:** cleaned-HTML serving on this tier is **opt-in per domain** in the
-Ooky dashboard and is fetched from Ooky's per-page API (a customer-deployed
+**Important:** cleaned-HTML serving on this tier starts once the integration is
+installed and an eligible page artifact is published. It is fetched from Ooky's per-page API (a customer-deployed
 Worker has no R2 binding, so it reads the artifact over HTTP rather than from the
-edge store the managed Worker uses). When the feature is off, or a page has
-nothing published, a bot hitting a *normal page* gets your **origin's HTML
+edge store the managed Worker uses). When a page has nothing published, a bot
+hitting a *normal page* gets your **origin's HTML
 unchanged**. JSON-LD injection into *human* pages and content-negotiation
 rewrites remain Full-DNS differentiators; they require Ooky inline in front of
 every request.
@@ -158,12 +164,15 @@ every request.
 - **Timeouts:** every upstream fetch (manifest serve, event ingest, bot-registry
   refresh) carries an `AbortSignal` deadline so a hung Ooky API never stalls
   your site.
-- **Stale-serve:** the last successful manifest per kind is kept in memory and
-  served if a later fetch returns a 5xx or times out, so a transient Ooky outage
-  doesn't break `/llms.txt` for crawlers. (A genuine pre-publish `404` is *not*
-  masked - it propagates so you know to publish.)
-- **No error caching:** the edge cache only stores 2xx responses, so a
-  pre-publish 404 won't stick for 5 minutes after you publish.
+- **Ownership-safe revalidation:** manifest and per-page artifact fetches bypass
+  the Workers Cache API on every request. A hostname can move between Ooky
+  workspaces, so the former owner's body is never a stale availability fallback.
+- **No artifact caching:** success and error responses are private and
+  `no-store`; a pre-publish 404 or transient 5xx cannot stick after recovery.
+- **Ownership proof:** every successful manifest or page artifact must include
+  a valid hostname claim ID, generation, exact edge namespace, and the fresh
+  request nonce. Fetches carry the domain-scoped Bearer key; revoked or former-
+  owner installs and replayed intermediary 200s fail closed.
 
 ## Configuration
 
@@ -197,6 +206,7 @@ Within ~30 seconds the integration in your Ooky dashboard should flip to
 | `/__ooky/health` reports `served_on_workers_dev: true` | You're hitting the `*.workers.dev` URL - the `routes` block isn't wired. |
 | Manifest endpoint returns a loud 500 about `YOUR_DOMAIN` | `OOKY_DOMAIN` is still the placeholder. Set it in `wrangler.toml` and redeploy. |
 | Manifest endpoint returns 404 | No published manifest yet. Publish from the Ooky dashboard's Builder. |
+| Manifest endpoint returns 401 | `OOKY_API_KEY` is missing, revoked, or belongs to a different/currently transferred hostname. Install the current domain key. |
 | `[ooky] ingest responded 401` in `wrangler tail` | `OOKY_API_KEY` secret missing or wrong. Re-run `wrangler secret put OOKY_API_KEY`. |
 | Bot events not appearing | Check `wrangler tail` to confirm the Worker is being invoked and watch for `[ooky] ingest` warnings. |
 
@@ -210,6 +220,12 @@ npx wrangler deploy --dry-run  # validate the config without deploying
 
 ## Changelog
 
+### 0.1.1
+
+Security release: ownership-sensitive manifest and page artifacts now bypass
+the Workers Cache API, are never stale-served from isolate memory, and return
+private `no-store` responses. `TEMPLATE_VERSION = "0.1.1"`.
+
 ### 0.1.0
 
 Initial release of the BYO-Worker template (`TEMPLATE_VERSION = "0.1.0"`).
@@ -219,7 +235,7 @@ Initial release of the BYO-Worker template (`TEMPLATE_VERSION = "0.1.0"`).
 - **Manifest serving** of the well-known AI URLs (`/llms.txt`, `/llms-full.txt`,
   `/agents.md`, `/.well-known/ai-manifest.json`, `/ai-manifest.json`) from Ooky's
   public CDN.
-- **Cleaned-HTML serving** to detected bots on content pages (opt-in per domain),
+- **Cleaned-HTML serving** to detected bots on content pages when an artifact is published,
   fetched from Ooky's bearer-authed per-page API.
 - **Event logging:** non-blocking bot events and `ai_referral` events fired to
   Ooky's ingest endpoint with the per-domain Bearer token.
