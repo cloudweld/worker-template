@@ -1,8 +1,8 @@
 /**
  * AI referrer detection - identifies humans arriving from AI platforms by
- * Referer header or utm_source. Self-contained copy of worker/src/referrals.js
- * (the template must not import from other packages at runtime). When you add a
- * platform to one, add it to the other to keep the tiers in parity.
+ * Referer header or utm_source. Self-contained because the template cannot
+ * import another package at runtime. It parses hostname boundaries and sends
+ * only the matched origin, never an AI conversation path or query string.
  */
 
 const AI_REFERRERS = [
@@ -46,15 +46,27 @@ export function detectAIReferral(request, url) {
   // Check Referer header
   const referer = request.headers.get("Referer") || request.headers.get("Referrer") || "";
   if (referer) {
-    const refererLower = referer.toLowerCase();
-    for (const entry of AI_REFERRERS) {
-      if (refererLower.includes(entry.pattern)) {
-        return {
-          source: entry.source,
-          referrerUrl: referer,
-          method: "referer_header",
-        };
+    try {
+      const parsed = new URL(referer);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid scheme");
+      const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+      for (const entry of AI_REFERRERS) {
+        const [expectedHost, ...pathParts] = entry.pattern.split("/");
+        const pathPrefix = pathParts.length ? `/${pathParts.join("/")}` : null;
+        const hostMatches = hostname === expectedHost || hostname.endsWith(`.${expectedHost}`);
+        const pathMatches = !pathPrefix
+          || parsed.pathname === pathPrefix
+          || parsed.pathname.startsWith(`${pathPrefix}/`);
+        if (hostMatches && pathMatches) {
+          return {
+            source: entry.source,
+            referrerUrl: parsed.origin,
+            method: "referer_header",
+          };
+        }
       }
+    } catch {
+      // Invalid Referer values do not qualify; UTM attribution remains below.
     }
   }
 

@@ -6,12 +6,13 @@
  *   - Detects humans arriving from AI platforms (ChatGPT/Perplexity/…) and
  *     fires an ai_referral event so the dashboard's attribution lands.
  *   - Serves the well-known AI URLs (/llms.txt, /agents.md, the AI manifest,
- *     and the MCP endpoint) from Ooky's public CDN.
- *   - Passes all other traffic through to your origin unchanged.
+ *     and the MCP endpoint) from Ooky's token-bound adapter API.
+ *   - Serves eligible AI bots the published cleaned-HTML representation when
+ *     available; otherwise passes the request through to origin.
  *
  * What this tier does NOT do (those are Full-DNS-tier differentiators):
- *   - It does not rewrite your human HTML or inject JSON-LD for bots - bots
- *     hitting normal pages get your origin's response, not a distilled doc.
+ *   - It does not rewrite human origin HTML or inject JSON-LD into origin
+ *     responses. Eligible AI bots can receive a complete distilled response.
  *   - It does not do IP-CIDR / reverse-DNS bot verification (UA-only).
  *   See the README "What this tier does and does NOT do" section.
  */
@@ -20,7 +21,8 @@ import { detectBot, getRegistry, isDistillableBot } from "./bots.js";
 import { detectAIReferral } from "./referrals.js";
 import { handleMcpInvocation, filterBrandSection, McpToolError } from "./mcp.js";
 
-const TEMPLATE_VERSION = "0.1.0";
+const TEMPLATE_VERSION = "0.2.0";
+const MAX_MCP_BODY_BYTES = 64 * 1024;
 
 // Placeholder value shipped in wrangler.toml. If it survives to runtime the
 // customer never set their real domain, so the manifest endpoints can't work.
@@ -44,25 +46,55 @@ const CONTENT_TYPE = {
   mcp: "application/json; charset=utf-8",
 };
 
-// Module-level last-good manifest cache, keyed by kind. Persists for the life
-// of the isolate and is served when the upstream returns a 5xx or times out,
-// mirroring the SDK's stale-serve intent so a transient Ooky outage doesn't
-// break /llms.txt for AI crawlers.
-const lastGoodManifest = new Map(); // kind → { body, contentType }
+const HOSTNAME_CLAIM_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const EDGE_NAMESPACE_RE = /^[a-z0-9][a-z0-9._-]{0,254}$/;
+
+function readArtifactOwnership(headers, expectedNonce) {
+  const hostnameClaimId = headers?.get?.("x-ooky-hostname-claim") || "";
+  const hostnameClaimGeneration = headers?.get?.("x-ooky-hostname-generation") || "";
+  const edgeNamespace = headers?.get?.("x-ooky-edge-namespace") || "";
+  const nonce = headers?.get?.("x-ooky-artifact-nonce") || "";
+  if (!HOSTNAME_CLAIM_ID_RE.test(hostnameClaimId)) return null;
+  if (!/^[1-9]\d{0,9}$/.test(hostnameClaimGeneration)) return null;
+  if (!EDGE_NAMESPACE_RE.test(edgeNamespace)) return null;
+  if (typeof expectedNonce !== "string" || nonce !== expectedNonce) return null;
+  return { hostnameClaimId, hostnameClaimGeneration, edgeNamespace };
+}
+
+function artifactNonce() {
+  return crypto.randomUUID().replaceAll("-", "");
+}
 
 function matchPath(pathname) {
   return PATH_MAP[pathname] || null;
 }
 
-/** Test-only: clear the module-level last-good manifest cache between tests. */
+/** Backward-compatible test hook; manifest bodies are deliberately not cached. */
 export function __resetManifestCache() {
-  lastGoodManifest.clear();
+  // Hostname ownership can transfer while this isolate stays warm. Retaining
+  // a previous owner's artifact would cross that terminal boundary.
 }
 
 /** True when OOKY_DOMAIN is unset, empty, or still the shipped placeholder. */
 function isDomainConfigured(env) {
   const d = env.OOKY_DOMAIN;
   return typeof d === "string" && d.length > 0 && d !== DOMAIN_PLACEHOLDER;
+}
+
+function normalizeHostname(value) {
+  if (typeof value !== "string") return "";
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/[/?#].*$/, "")
+    .replace(/\.$/, "");
+}
+
+function requestMatchesConfiguredHostname(url, env) {
+  return normalizeHostname(url?.hostname) === normalizeHostname(env.OOKY_DOMAIN);
 }
 
 /**
@@ -110,11 +142,18 @@ async function fetchCleanedHtml(path, env) {
   if (!env.OOKY_API_KEY) return null;
   const url = `${env.OOKY_API_BASE}/public/page/cleaned-html?path=${encodeURIComponent(path)}`;
   try {
+    const nonce = artifactNonce();
     const upstream = await fetch(url, {
-      headers: { Authorization: `Bearer ${env.OOKY_API_KEY}` },
+      headers: {
+        Authorization: `Bearer ${env.OOKY_API_KEY}`,
+        "X-Ooky-Artifact-Nonce": nonce,
+      },
+      cf: { cacheTtl: 0, cacheEverything: false },
+      cache: "no-store",
       signal: timeoutSignal(8000),
     });
     if (upstream.status !== 200) return null; // 204 = feature off / nothing published
+    if (!readArtifactOwnership(upstream.headers, nonce)) return null;
     const html = await upstream.text();
     return html && html.length > 0 ? html : null;
   } catch {
@@ -123,28 +162,51 @@ async function fetchCleanedHtml(path, env) {
 }
 
 /**
- * Fetch a manifest kind from Ooky's public CDN.
+ * Fetch a manifest kind from Ooky's token-bound adapter API.
  * Returns { ok, status, body, contentType } - never throws.
  */
 async function fetchManifest(kind, env) {
   const url = `${env.OOKY_API_BASE}/public/manifest/${encodeURIComponent(env.OOKY_DOMAIN)}/${kind}`;
   try {
+    if (!env.OOKY_API_KEY) {
+      return { ok: false, status: 401, body: null, contentType: null };
+    }
+    const nonce = artifactNonce();
     const upstream = await fetch(url, {
-      // Don't cache error responses at the edge - a pre-publish 404 must not
-      // stick for 5 minutes after the customer publishes. Only 2xx is cached.
-      cf: { cacheTtlByStatus: { "200-299": 300, "404": 0, "500-599": 0 } },
+      // The URL stays stable when hostname ownership transfers. Bypass the
+      // Workers cache for every status so a warm customer isolate cannot
+      // replay the previous tenant's artifact.
+      cf: { cacheTtl: 0, cacheEverything: false },
+      headers: {
+        Authorization: `Bearer ${env.OOKY_API_KEY}`,
+        "X-Ooky-Artifact-Nonce": nonce,
+      },
+      cache: "no-store",
       signal: timeoutSignal(8000),
     });
+    const ownership = upstream.ok ? readArtifactOwnership(upstream.headers, nonce) : null;
+    if (upstream.ok && !ownership) {
+      return {
+        ok: false,
+        status: 502,
+        body: null,
+        contentType: null,
+        error: new Error("manifest ownership could not be verified"),
+      };
+    }
     const body = await upstream.text();
     return {
       ok: upstream.ok,
       status: upstream.status,
       body,
       contentType: upstream.headers.get("content-type") || CONTENT_TYPE[kind],
+      hostnameClaimId: ownership?.hostnameClaimId || null,
+      hostnameClaimGeneration: ownership?.hostnameClaimGeneration || null,
+      edgeNamespace: ownership?.edgeNamespace || null,
     };
   } catch (err) {
-    // Timeout / network error - signalled as a synthetic 5xx so the caller
-    // can fall back to the last-good cache.
+    // Timeout / network error - signalled as a synthetic 5xx. Never replay a
+    // prior success because the hostname may have changed owners meanwhile.
     return { ok: false, status: 599, body: null, contentType: null, error: err };
   }
 }
@@ -153,38 +215,28 @@ async function serveManifest(kind, env) {
   const result = await fetchManifest(kind, env);
 
   if (result.ok) {
-    lastGoodManifest.set(kind, { body: result.body, contentType: CONTENT_TYPE[kind] });
+    const headers = {
+      "Content-Type": CONTENT_TYPE[kind],
+      "Cache-Control": "private, no-store, max-age=0, s-maxage=0",
+      "X-Ooky-Worker": "byo",
+    };
+    headers["X-Ooky-Hostname-Claim"] = result.hostnameClaimId;
+    headers["X-Ooky-Hostname-Generation"] = result.hostnameClaimGeneration;
+    headers["X-Ooky-Edge-Namespace"] = result.edgeNamespace;
     return new Response(result.body, {
       status: 200,
-      headers: {
-        "Content-Type": CONTENT_TYPE[kind],
-        "Cache-Control": "public, max-age=300, s-maxage=600",
-        "X-Ooky-Worker": "byo",
-      },
+      headers,
     });
   }
 
-  // Upstream failure. On a 5xx/timeout, serve the last-good copy if we have one
-  // so AI crawlers keep getting intelligence through a transient Ooky outage.
-  if (result.status >= 500) {
-    const stale = lastGoodManifest.get(kind);
-    if (stale) {
-      return new Response(stale.body, {
-        status: 200,
-        headers: {
-          "Content-Type": stale.contentType,
-          "Cache-Control": "public, max-age=60",
-          "X-Ooky-Worker": "byo",
-          "X-Ooky-Stale": "1",
-        },
-      });
-    }
-  }
-
-  // No stale copy (or a 4xx like a pre-publish 404) - propagate the status.
+  // Propagate failures. Availability fallback is the origin content path;
+  // stale brand intelligence is never an ownership-safe fallback.
   return new Response(`Manifest unavailable (${result.status})`, {
     status: result.status,
-    headers: { "Content-Type": "text/plain; charset=utf-8" },
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "private, no-store, max-age=0, s-maxage=0",
+    },
   });
 }
 
@@ -195,15 +247,6 @@ async function serveManifest(kind, env) {
 async function getBrandInfo(env, args) {
   const result = await fetchManifest("manifest", env);
   if (!result.ok || result.body == null) {
-    // Fall back to last-good on a transient failure.
-    const stale = lastGoodManifest.get("manifest");
-    if (stale && stale.body) {
-      try {
-        return filterBrandSection(JSON.parse(stale.body), args?.section);
-      } catch {
-        /* fall through */
-      }
-    }
     throw new McpToolError("Brand information not available");
   }
   let parsed;
@@ -212,7 +255,6 @@ async function getBrandInfo(env, args) {
   } catch {
     throw new McpToolError("Brand information not available");
   }
-  lastGoodManifest.set("manifest", { body: result.body, contentType: CONTENT_TYPE.manifest });
   return filterBrandSection(parsed, args?.section);
 }
 
@@ -236,14 +278,14 @@ async function serveMcp(request, env) {
   }
 
   if (request.method === "POST") {
-    let body = null;
-    try {
-      body = await request.json();
-    } catch {
-      // null → JSON-RPC parse error, surfaced by handleMcpInvocation.
-      body = null;
+    const parsed = await readBoundedJson(request, MAX_MCP_BODY_BYTES);
+    if (!parsed.ok && parsed.error === "too_large") {
+      return new Response(JSON.stringify({ error: "Request body too large" }), {
+        status: 413,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
     }
-    const { status, headers, body: respBody } = await handleMcpInvocation(body, {
+    const { status, headers, body: respBody } = await handleMcpInvocation(parsed.ok ? parsed.value : null, {
       domain: env.OOKY_DOMAIN,
       version: TEMPLATE_VERSION,
       getBrandInfo: (args) => getBrandInfo(env, args),
@@ -253,6 +295,40 @@ async function serveMcp(request, env) {
 
   // GET / other → static descriptor.
   return serveManifest("mcp", env);
+}
+
+async function readBoundedJson(request, maxBytes) {
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) return { ok: false, error: "too_large" };
+  const reader = request.body?.getReader?.();
+  if (!reader) return { ok: false, error: "invalid_json" };
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("request body too large").catch(() => {});
+        return { ok: false, error: "too_large" };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, error: "invalid_json" };
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return { ok: true, value: JSON.parse(new TextDecoder().decode(bytes)) };
+  } catch {
+    return { ok: false, error: "invalid_json" };
+  }
 }
 
 /** Build the manifest-misconfigured response (loud 500). */
@@ -326,6 +402,7 @@ function healthResponse(url, env) {
     domain_configured: domainConfigured,
     api_key_set: Boolean(env.OOKY_API_KEY),
     bot_cache_kv_bound: Boolean(env.OOKY_BOT_CACHE),
+    origin_service_bound: Boolean(env.ORIGIN_SERVICE),
     routes_wired: hostMatchesDomain,
     problems,
     next_steps: problems.length
@@ -375,6 +452,26 @@ function recordEvent(env, payload) {
     });
 }
 
+/**
+ * Hand the request to whatever serves the real site.
+ *
+ * Normal case: the customer runs an origin server behind Cloudflare, so a plain
+ * `fetch(request)` reaches it.
+ *
+ * But a site can also BE a Worker - Workers Static Assets, Pages, or any
+ * Worker-served app. Those zones have no origin: their DNS record is a proxied
+ * placeholder, and the site Worker answers the route. Binding this Worker to
+ * that same route takes the route away from the site Worker (a route pattern
+ * maps to exactly one script) and `fetch(request)` then goes looking for an
+ * origin that does not exist - every request 522s.
+ *
+ * Bind ORIGIN_SERVICE to the site's Worker and we call it directly instead,
+ * Worker-to-Worker, no origin involved. Unbound, behavior is unchanged.
+ */
+function passthrough(request, env) {
+  return env.ORIGIN_SERVICE ? env.ORIGIN_SERVICE.fetch(request) : fetch(request);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -396,7 +493,15 @@ export default {
       // while every AI artifact is broken, so be loud on exactly those paths.
       const kind = matchPath(url.pathname);
       if (kind) return misconfiguredManifestResponse();
-      return fetch(request);
+      return passthrough(request, env);
+    }
+
+    // One Worker script is authorized for one canonical Ooky hostname. If a
+    // legacy Cloudflare account reused a script name across routes, never let
+    // the older route fetch, emit, or serve the newer tenant's artifacts.
+    // Passthrough preserves the mismatched hostname's origin behavior.
+    if (!requestMatchesConfiguredHostname(url, env)) {
+      return passthrough(request, env);
     }
 
     const ua = request.headers.get("user-agent") || "";
@@ -462,9 +567,9 @@ export default {
     // Googlebot/Bingbot/link-preview bots would deindex the site; they fall
     // through to origin like a human (still logged above). Eligibility
     // mirrors the SDK + managed Worker: GET document navigations only, never
-    // assets or non-HTML clients. The per-page API returns 204 when the
-    // feature is off or nothing is published, so fetchCleanedHtml yields null
-    // and we fall straight through to origin.
+    // assets or non-HTML clients. The per-page API returns 204 when nothing is
+    // published, so fetchCleanedHtml yields null and we fall straight through
+    // to origin.
     if (bot && isDistillableBot(bot)) {
       const eligible =
         request.method === "GET" &&
@@ -477,7 +582,8 @@ export default {
             status: 200,
             headers: {
               "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "public, max-age=3600",
+              "Cache-Control": "private, no-store, max-age=0, s-maxage=0",
+              Vary: "User-Agent",
               "X-Ooky-CleanedHtml": "1",
             },
           });
@@ -485,6 +591,6 @@ export default {
       }
     }
 
-    return fetch(request);
+    return passthrough(request, env);
   },
 };
