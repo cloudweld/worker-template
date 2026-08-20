@@ -1,0 +1,43 @@
+#:schema node_modules/wrangler/config-schema.json
+# Ooky Worker for cloudweld.ai — a real, working example of the no-origin case.
+#
+# cloudweld.ai has NO origin server. The site is a Cloudflare Worker
+# (`cloudweld-site`, Astro prerendered to Workers Static Assets), and the zone's
+# DNS records are proxied placeholders.
+#
+# A route pattern maps to exactly ONE script, so this Worker takes
+# `cloudweld.ai/*` away from `cloudweld-site`. Without the ORIGIN_SERVICE
+# binding below, the normal origin passthrough would dial an origin that does
+# not exist and every request would return HTTP 522. That is not theoretical —
+# it took cloudweld.ai down for ~2.5 days on 2026-08-18.
+#
+# The binding makes passthrough go Worker-to-Worker instead. See the
+# "If your site has no origin server" section in README.md.
+#
+# Deploy:
+#   wrangler secret put OOKY_API_KEY -c wrangler.cloudweld.toml
+#   wrangler deploy -c wrangler.cloudweld.toml
+#
+# Roll back (restores cloudweld-site to the route) — from the enterprise repo:
+#   npm run deploy
+
+name = "ooky-cloudweld-ai-7c2f91a4"
+main = "src/index.js"
+compatibility_date = "2026-04-01"
+
+# This Worker is only useful bound to the domain's routes. A *.workers.dev URL
+# would also publish a second, crawlable copy of cloudweld.ai.
+workers_dev = false
+
+routes = [{ pattern = "cloudweld.ai/*", zone_name = "cloudweld.ai" }]
+
+# REQUIRED for the no-origin case. Without this, cloudweld.ai returns 522.
+[[services]]
+binding = "ORIGIN_SERVICE"
+service = "cloudweld-site"
+
+[vars]
+OOKY_DOMAIN = "cloudweld.ai"
+OOKY_API_BASE = "https://api.ooky.ai/api"
+
+# OOKY_API_KEY is a secret — set with `wrangler secret put`, never in [vars].

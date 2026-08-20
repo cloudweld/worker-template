@@ -4,8 +4,8 @@
  *   - manifest serve + origin passthrough
  *   - bot event firing + geo population
  *   - AI-referral firing (human from ChatGPT/Perplexity)
- *   - CDN 5xx → stale-serve from last-good cache
- *   - CDN 5xx with no cached copy → propagate status
+ *   - ownership-safe no-cache manifest fetches
+ *   - CDN 5xx/timeouts → propagate without prior-owner replay
  *   - pre-publish 404 propagates (and isn't cached)
  *   - YOUR_DOMAIN misconfig → loud 500 on manifest paths, passthrough elsewhere
  *   - MCP POST (initialize, tools/list, tools/call, parse error)
@@ -14,7 +14,17 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import worker, { __resetManifestCache } from "../src/index.js";
-import { detectBot, DEFAULT_BOTS } from "../src/bots.js";
+import {
+  detectBot,
+  DEFAULT_BOTS,
+  MAX_BOT_REGISTRY_ENTRIES,
+  sanitizeBotRegistry,
+} from "../src/bots.js";
+
+Object.defineProperty(globalThis.crypto, "randomUUID", {
+  configurable: true,
+  value: () => "11111111-1111-4111-8111-111111111111",
+});
 
 function makeEnv(overrides = {}) {
   return {
@@ -28,6 +38,14 @@ function makeEnv(overrides = {}) {
 function makeCtx() {
   return { waitUntil: vi.fn() };
 }
+
+const ARTIFACT_HEADERS = {
+  "Content-Type": "text/plain",
+  "X-Ooky-Hostname-Claim": "11111111-1111-4111-8111-111111111111",
+  "X-Ooky-Hostname-Generation": "1",
+  "X-Ooky-Edge-Namespace": "acme-com--fixture-g1",
+  "X-Ooky-Artifact-Nonce": "11111111111141118111111111111111",
+};
 
 // In the real Workers runtime, request.cf is a runtime-injected property. The
 // standard Request constructor doesn't honour a `cf` init option, so attach it
@@ -52,7 +70,7 @@ describe("worker-template manifest serving", () => {
       if (String(url).endsWith("/manifest/acme.com/llms")) {
         return new Response("# Acme\n> intel", {
           status: 200,
-          headers: { "Content-Type": "text/plain" },
+          headers: ARTIFACT_HEADERS,
         });
       }
       throw new Error("Unexpected fetch: " + url);
@@ -69,7 +87,7 @@ describe("worker-template manifest serving", () => {
     expect(await res.text()).toContain("# Acme");
   });
 
-  it("does not set a scalar cacheTtl that would cache errors", async () => {
+  it("bypasses the edge cache for every ownership-sensitive response", async () => {
     let capturedInit;
     globalThis.fetch = vi.fn(async (url, init) => {
       capturedInit = init;
@@ -80,12 +98,40 @@ describe("worker-template manifest serving", () => {
       makeEnv(),
       makeCtx()
     );
-    expect(capturedInit.cf.cacheTtl).toBeUndefined();
-    expect(capturedInit.cf.cacheTtlByStatus).toEqual({
-      "200-299": 300,
-      "404": 0,
-      "500-599": 0,
-    });
+    expect(capturedInit.cf).toEqual({ cacheTtl: 0, cacheEverything: false });
+    expect(capturedInit.cache).toBe("no-store");
+    expect(capturedInit.headers.Authorization).toBe("Bearer ooky_sk_TEST");
+    expect(capturedInit.headers["X-Ooky-Artifact-Nonce"]).toBe(
+      "11111111111141118111111111111111"
+    );
+  });
+
+  it("rejects a 200 artifact without a complete ownership proof", async () => {
+    globalThis.fetch = vi.fn(async () => new Response("former owner", { status: 200 }));
+    const res = await worker.fetch(
+      new Request("https://acme.com/llms.txt"),
+      makeEnv(),
+      makeCtx()
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).not.toContain("former owner");
+  });
+
+  it("rejects a valid ownership tuple replayed for a different request nonce", async () => {
+    globalThis.fetch = vi.fn(async () => new Response("former owner", {
+      status: 200,
+      headers: {
+        ...ARTIFACT_HEADERS,
+        "X-Ooky-Artifact-Nonce": "22222222222242228222222222222222",
+      },
+    }));
+    const res = await worker.fetch(
+      new Request("https://acme.com/llms.txt"),
+      makeEnv(),
+      makeCtx()
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).not.toContain("former owner");
   });
 
   it("falls through to origin for non-matching paths", async () => {
@@ -100,6 +146,45 @@ describe("worker-template manifest serving", () => {
     expect(await res.text()).toBe(originBody);
   });
 
+  it("passes a mismatched legacy shared-script hostname straight to origin", async () => {
+    const calls = [];
+    globalThis.fetch = vi.fn(async (input) => {
+      calls.push(input);
+      return new Response("<html>other origin</html>", { status: 200 });
+    });
+
+    const res = await worker.fetch(
+      new Request("https://other-tenant.example/llms.txt", {
+        headers: { "user-agent": "GPTBot" },
+      }),
+      makeEnv({ OOKY_DOMAIN: "acme.com" }),
+      makeCtx()
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("<html>other origin</html>");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toBeInstanceOf(Request);
+    expect(new URL(calls[0].url).hostname).toBe("other-tenant.example");
+  });
+
+  it("accepts www as the same canonical configured hostname", async () => {
+    globalThis.fetch = vi.fn(async (url) => {
+      if (String(url).endsWith("/manifest/acme.com/llms")) {
+        return new Response("# Acme", { status: 200, headers: ARTIFACT_HEADERS });
+      }
+      throw new Error("Unexpected fetch: " + url);
+    });
+
+    const res = await worker.fetch(
+      new Request("https://www.acme.com/llms.txt"),
+      makeEnv(),
+      makeCtx()
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("# Acme");
+  });
+
   it("propagates a pre-publish 404 (no stale copy)", async () => {
     globalThis.fetch = vi.fn(async () => new Response("not found", { status: 404 }));
     const res = await worker.fetch(
@@ -108,19 +193,23 @@ describe("worker-template manifest serving", () => {
       makeCtx()
     );
     expect(res.status).toBe(404);
+    expect(res.headers.get("cache-control")).toContain("no-store");
   });
 });
 
-describe("worker-template stale-serve on CDN outage", () => {
+describe("worker-template ownership-safe failure behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     __resetManifestCache();
   });
 
-  it("serves the last-good copy on a CDN 5xx after a prior success", async () => {
+  it("does not replay a prior owner on a CDN 5xx after a success", async () => {
     const env = makeEnv({ OOKY_DOMAIN: "stale-test.com" });
     // First request: upstream 200 — populates the last-good cache.
-    globalThis.fetch = vi.fn(async () => new Response("# Fresh intel", { status: 200 }));
+    globalThis.fetch = vi.fn(async () => new Response("# Fresh intel", {
+      status: 200,
+      headers: ARTIFACT_HEADERS,
+    }));
     const ok = await worker.fetch(
       new Request("https://stale-test.com/llms.txt"),
       env,
@@ -129,16 +218,18 @@ describe("worker-template stale-serve on CDN outage", () => {
     expect(ok.status).toBe(200);
     expect(await ok.text()).toBe("# Fresh intel");
 
-    // Second request: upstream 503 — should serve the cached copy, not the error.
+    // Second request: upstream 503. The hostname may have transferred since
+    // the success, so the prior body is not an eligible fallback.
     globalThis.fetch = vi.fn(async () => new Response("upstream boom", { status: 503 }));
     const stale = await worker.fetch(
       new Request("https://stale-test.com/llms.txt"),
       env,
       makeCtx()
     );
-    expect(stale.status).toBe(200);
-    expect(stale.headers.get("x-ooky-stale")).toBe("1");
-    expect(await stale.text()).toBe("# Fresh intel");
+    expect(stale.status).toBe(503);
+    expect(stale.headers.get("cache-control")).toContain("no-store");
+    expect(stale.headers.get("x-ooky-stale")).toBeNull();
+    expect(await stale.text()).not.toBe("# Fresh intel");
   });
 
   it("propagates a 5xx when there is no cached copy", async () => {
@@ -152,9 +243,12 @@ describe("worker-template stale-serve on CDN outage", () => {
     expect(res.status).toBe(503);
   });
 
-  it("serves last-good on a fetch timeout/abort (synthetic 5xx)", async () => {
+  it("does not replay last-good on a fetch timeout/abort", async () => {
     const env = makeEnv({ OOKY_DOMAIN: "timeout-test.com" });
-    globalThis.fetch = vi.fn(async () => new Response("# cached", { status: 200 }));
+    globalThis.fetch = vi.fn(async () => new Response("# cached", {
+      status: 200,
+      headers: ARTIFACT_HEADERS,
+    }));
     await worker.fetch(new Request("https://timeout-test.com/llms.txt"), env, makeCtx());
 
     globalThis.fetch = vi.fn(async () => {
@@ -165,9 +259,9 @@ describe("worker-template stale-serve on CDN outage", () => {
       env,
       makeCtx()
     );
-    expect(res.status).toBe(200);
-    expect(res.headers.get("x-ooky-stale")).toBe("1");
-    expect(await res.text()).toBe("# cached");
+    expect(res.status).toBe(599);
+    expect(res.headers.get("x-ooky-stale")).toBeNull();
+    expect(await res.text()).not.toBe("# cached");
   });
 });
 
@@ -223,7 +317,7 @@ describe("worker-template bot + referral events", () => {
       new Request("https://acme.com/landing", {
         headers: {
           "user-agent": "Mozilla/5.0 (Macintosh) Chrome/120",
-          referer: "https://chatgpt.com/",
+          referer: "https://chatgpt.com/c/private-conversation?prompt=secret#answer",
         },
       }),
       { country: "GB" }
@@ -237,7 +331,7 @@ describe("worker-template bot + referral events", () => {
     expect(payload.event_type).toBe("ai_referral");
     expect(payload.referral.source).toBe("chatgpt");
     expect(payload.referral.detection_method).toBe("referer_header");
-    expect(payload.referral.referrer_url).toBe("https://chatgpt.com/");
+    expect(payload.referral.referrer_url).toBe("https://chatgpt.com");
     expect(payload.request.page_path).toBe("/landing");
     expect(payload.geo.country).toBe("GB");
   });
@@ -313,14 +407,16 @@ describe("worker-template misconfiguration handling", () => {
     expect(await res.text()).toBe(originBody);
   });
 
-  it("STILL serves manifests when OOKY_API_KEY is missing — events just disabled, no loud 500", async () => {
-    // Manifest serving needs only OOKY_DOMAIN; the key gates analytics only.
-    // A domain-configured Worker with no key must serve AI artifacts (200),
-    // and recordEvent must no-op rather than POST `Bearer undefined`.
+  it("fails closed when OOKY_API_KEY is missing", async () => {
+    // Manifest delivery is bound to the current domain-scoped credential so a
+    // former owner cannot fetch a successor's artifact after a transfer.
     const urls = [];
     globalThis.fetch = vi.fn(async (req) => {
       urls.push(typeof req === "string" ? req : req.url);
-      return new Response("# llms\nAcme brand summary", { status: 200 });
+      return new Response("# llms\nAcme brand summary", {
+        status: 200,
+        headers: ARTIFACT_HEADERS,
+      });
     });
     const res = await worker.fetch(
       // A bot UA so the event path runs — and proves recordEvent no-ops w/o key.
@@ -330,7 +426,8 @@ describe("worker-template misconfiguration handling", () => {
       makeEnv({ OOKY_API_KEY: undefined }),
       makeCtx()
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
+    expect(urls.some((u) => u.includes("/public/manifest/"))).toBe(false);
     expect(urls.some((u) => u.includes("/ingest/events"))).toBe(false);
   });
 });
@@ -396,7 +493,7 @@ describe("worker-template MCP POST", () => {
       if (String(url).includes("/manifest/acme.com/manifest")) {
         return new Response(
           JSON.stringify({ brand: { name: "Acme", website: "https://acme.com" } }),
-          { status: 200, headers: { "Content-Type": "application/json" } }
+          { status: 200, headers: { ...ARTIFACT_HEADERS, "Content-Type": "application/json" } }
         );
       }
       if (String(url).includes("/public/bots")) {
@@ -470,6 +567,18 @@ describe("worker-template MCP POST", () => {
     expect(body.error.code).toBe(-32700);
   });
 
+  it("rejects actual bodies over 64KB even without Content-Length", async () => {
+    globalThis.fetch = vi.fn(async () => new Response("origin", { status: 200 }));
+    const req = new Request("https://acme.com/mcp", {
+      method: "POST",
+      headers: { "user-agent": "MCP-Client", "content-type": "application/json" },
+      body: JSON.stringify({ pad: "x".repeat(64 * 1024 + 1) }),
+    });
+    req.headers.delete("content-length");
+    const res = await worker.fetch(req, makeEnv(), makeCtx());
+    expect(res.status).toBe(413);
+  });
+
   it("handles OPTIONS preflight with CORS", async () => {
     const req = new Request("https://acme.com/mcp", {
       method: "OPTIONS",
@@ -485,7 +594,7 @@ describe("worker-template MCP POST", () => {
       if (String(url).includes("/manifest/acme.com/mcp")) {
         return new Response(JSON.stringify({ mcp: "descriptor" }), {
           status: 200,
-          headers: { "Content-Type": "application/json" },
+          headers: { ...ARTIFACT_HEADERS, "Content-Type": "application/json" },
         });
       }
       if (String(url).includes("/public/bots")) {
@@ -551,6 +660,22 @@ describe("detectBot helper", () => {
     expect(detectBot("GPTBot/1.0", bad)?.pattern).toBe("GPTBot");
     expect(detectBot("anything", "not-an-array")).toBeNull();
   });
+
+  it("sanitizes and caps a live registry before the request hot path", () => {
+    const oversized = [null, { pattern: "" }, { pattern: 123 }];
+    for (let i = 0; i < MAX_BOT_REGISTRY_ENTRIES + 20; i++) {
+      oversized.push({ name: `B${i}`, pattern: `bot-entry-${i};` });
+    }
+
+    const cleaned = sanitizeBotRegistry(oversized);
+
+    expect(cleaned).toHaveLength(MAX_BOT_REGISTRY_ENTRIES);
+    expect(cleaned[0].pattern).toBe("bot-entry-0;");
+    expect(
+      detectBot(`x bot-entry-${MAX_BOT_REGISTRY_ENTRIES + 10};`, oversized)
+    ).toBeNull();
+    expect(sanitizeBotRegistry("not-an-array")).toBeNull();
+  });
 });
 
 describe("worker-template cleaned-HTML serving (the takeover)", () => {
@@ -564,10 +689,12 @@ describe("worker-template cleaned-HTML serving (the takeover)", () => {
     globalThis.fetch = vi.fn(async (url, init) => {
       if (String(url).includes("/public/page/cleaned-html")) {
         expect(init?.headers?.Authorization).toBe("Bearer ooky_sk_TEST");
+        expect(init?.cf).toEqual({ cacheTtl: 0, cacheEverything: false });
+        expect(init?.cache).toBe("no-store");
         expect(String(url)).toContain("path=%2Fpricing");
         return new Response("<html><body>distilled</body></html>", {
           status: 200,
-          headers: { "content-type": "text/html" },
+          headers: { ...ARTIFACT_HEADERS, "content-type": "text/html" },
         });
       }
       return new Response("ORIGIN PAGE", { status: 200 });
@@ -579,10 +706,12 @@ describe("worker-template cleaned-HTML serving (the takeover)", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("<html><body>distilled</body></html>");
     expect(res.headers.get("x-robots-tag")).toBeNull();
+    expect(res.headers.get("cache-control")).toContain("no-store");
+    expect(res.headers.get("vary")).toBe("User-Agent");
     expect(res.headers.get("x-ooky-cleanedhtml")).toBe("1");
   });
 
-  it("falls through to origin when the per-page API returns 204 (feature off / nothing published)", async () => {
+  it("falls through to origin when the per-page API returns 204 (nothing published)", async () => {
     globalThis.fetch = vi.fn(async (url) => {
       if (String(url).includes("/public/page/cleaned-html")) {
         return new Response(null, { status: 204 });
@@ -692,5 +821,109 @@ describe("worker-template search/social bots never get distilled content", () =>
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ORIGIN PAGE");
     expect(res.headers.get("x-robots-tag")).toBeNull();
+  });
+});
+
+describe("ORIGIN_SERVICE binding (site is a Worker, no origin server)", () => {
+  beforeEach(() => {
+    __resetManifestCache();
+  });
+
+  function makeOriginService(body = "<html>site worker</html>") {
+    const calls = [];
+    return {
+      calls,
+      binding: {
+        fetch: vi.fn(async (request) => {
+          calls.push(request.url);
+          return new Response(body, { status: 200 });
+        }),
+      },
+    };
+  }
+
+  it("routes content passthrough to the bound Worker instead of origin", async () => {
+    const originFetch = vi.fn(async () => new Response("ORIGIN", { status: 200 }));
+    globalThis.fetch = originFetch;
+    const { binding, calls } = makeOriginService();
+
+    const req = new Request("https://acme.com/pricing", {
+      headers: { "user-agent": "Mozilla" },
+    });
+    const res = await worker.fetch(
+      req,
+      makeEnv({ ORIGIN_SERVICE: binding }),
+      makeCtx()
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("<html>site worker</html>");
+    expect(calls).toEqual(["https://acme.com/pricing"]);
+    // The whole point: no origin fetch is attempted, because there is no origin.
+    expect(originFetch).not.toHaveBeenCalled();
+  });
+
+  it("uses the binding when OOKY_DOMAIN is still the placeholder", async () => {
+    const originFetch = vi.fn(async () => new Response("ORIGIN", { status: 200 }));
+    globalThis.fetch = originFetch;
+    const { binding } = makeOriginService("<html>unconfigured</html>");
+
+    const res = await worker.fetch(
+      new Request("https://acme.com/", { headers: { "user-agent": "Mozilla" } }),
+      makeEnv({ OOKY_DOMAIN: "YOUR_DOMAIN", ORIGIN_SERVICE: binding }),
+      makeCtx()
+    );
+
+    expect(await res.text()).toBe("<html>unconfigured</html>");
+    expect(originFetch).not.toHaveBeenCalled();
+  });
+
+  it("uses the binding when the request host does not match OOKY_DOMAIN", async () => {
+    const originFetch = vi.fn(async () => new Response("ORIGIN", { status: 200 }));
+    globalThis.fetch = originFetch;
+    const { binding } = makeOriginService("<html>other host</html>");
+
+    const res = await worker.fetch(
+      new Request("https://other.example/", {
+        headers: { "user-agent": "Mozilla" },
+      }),
+      makeEnv({ ORIGIN_SERVICE: binding }),
+      makeCtx()
+    );
+
+    expect(await res.text()).toBe("<html>other host</html>");
+    expect(originFetch).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a plain origin fetch when the binding is absent", async () => {
+    const originFetch = vi.fn(async () => new Response("ORIGIN", { status: 200 }));
+    globalThis.fetch = originFetch;
+
+    const res = await worker.fetch(
+      new Request("https://acme.com/pricing", {
+        headers: { "user-agent": "Mozilla" },
+      }),
+      makeEnv(),
+      makeCtx()
+    );
+
+    expect(await res.text()).toBe("ORIGIN");
+    expect(originFetch).toHaveBeenCalled();
+  });
+
+  it("reports origin_service_bound in the health check", async () => {
+    const bound = await worker.fetch(
+      new Request("https://acme.com/__ooky/health"),
+      makeEnv({ ORIGIN_SERVICE: makeOriginService().binding }),
+      makeCtx()
+    );
+    expect((await bound.json()).origin_service_bound).toBe(true);
+
+    const unbound = await worker.fetch(
+      new Request("https://acme.com/__ooky/health"),
+      makeEnv(),
+      makeCtx()
+    );
+    expect((await unbound.json()).origin_service_bound).toBe(false);
   });
 });
