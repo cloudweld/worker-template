@@ -78,7 +78,7 @@ npx wrangler secret put OOKY_API_KEY
 npx wrangler kv namespace create OOKY_BOT_CACHE
 # Paste the printed `id` into wrangler.toml under [[kv_namespaces]]
 
-npx wrangler deploy
+npx wrangler deploy --config wrangler.toml
 ```
 
 ## One-click deploy
@@ -183,18 +183,18 @@ every request.
 | `OOKY_API_KEY` | `wrangler secret put` | **Yes** | Per-domain Bearer token (`ooky_sk_*`) from the Ooky dashboard. |
 | `OOKY_API_BASE` | `wrangler.toml` `[vars]` | No | Defaults to `https://api.ooky.ai/api`. Override only if you self-host Ooky. |
 | `OOKY_BOT_CACHE` | KV binding | No | Optional. Caches the bot registry in KV across requests/isolates. Without it, each new isolate refetches on its first request (in-memory only). |
-| `ORIGIN_SERVICE` | Service binding | No | Only if your site **is** a Worker (Workers Static Assets, Pages) and has no origin server. Passthrough then goes Worker-to-Worker instead of dialing a nonexistent origin. See below. |
+| `ORIGIN_SERVICE` | Service binding | No | Required when replacing an existing site Worker's route. A site Worker on a Custom Domain can use native passthrough. See below. |
 
-### If your site has no origin server
+### If your site is already served by a Worker
 
-Most sites are a server behind Cloudflare, so the Worker's passthrough
-(`fetch(request)`) reaches it. But if your site **is** a Worker - Workers Static
-Assets, Pages, or any Worker-served app - there is no origin at all: the DNS
-record is a proxied placeholder and your site's Worker answers the route.
+Cloudflare distinguishes a Worker on a **Custom Domain** from a Worker on a
+**route**. Native passthrough (`fetch(request)`) reaches a normal server or a
+site Worker on a Custom Domain. It cannot invoke another same-zone route Worker.
 
-A Cloudflare route pattern maps to exactly **one** script. Pointing this Worker
-at that route takes the route away from your site's Worker, and passthrough then
-dials an origin that does not exist - so **every request returns HTTP 522**.
+A route pattern maps to exactly **one** script. Replacing an existing site's
+route requires binding that original script so it continues to serve the site.
+Do not overwrite overlapping wildcard or path routes without reviewing their
+behavior; the Ooky guided setup blocks these ambiguous configurations.
 
 Bind your site's Worker instead:
 
@@ -205,15 +205,21 @@ binding = "ORIGIN_SERVICE"
 service = "your-site-worker-name"
 ```
 
-Passthrough now goes Worker-to-Worker, no origin involved. Verify with
-`/__ooky/health`, which reports `origin_service_bound: true`. Leave the binding
-out if you have a real origin - behavior is unchanged.
+Passthrough now invokes the bound Worker. Verify with
+`/__ooky/health?check_origin=1`: `origin.reachable` must be `true`, and `origin.mode`
+is `service` for a binding or `fetch` for native passthrough. The probe performs a
+sanitized homepage request, cancels its body, and times out after eight seconds.
+The regular health endpoint only checks configuration. A failing service returns
+502 to visitors without replaying their request into a different origin.
+
+Cloudflare documents these distinct paths in [Routes](https://developers.cloudflare.com/workers/configuration/routing/routes/)
+and [Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
 
 ## Verifying the deploy
 
 ```bash
 # Self-diagnostic - checks routes/domain/key wiring and tells you what's wrong:
-curl -s https://your-domain.com/__ooky/health | jq
+curl -s 'https://your-domain.com/__ooky/health?check_origin=1' | jq
 
 # Bot path + a manifest path:
 curl -s https://your-domain.com/llms.txt | head
@@ -227,7 +233,7 @@ Within ~30 seconds the integration in your Ooky dashboard should flip to
 
 | Symptom | Likely cause |
 |---|---|
-| **Whole site returns HTTP 522 right after deploying this Worker** | Your site has no origin server - it *is* a Worker. This Worker took the route from it and origin passthrough has nothing to dial. Bind `ORIGIN_SERVICE` to your site's Worker (see Configuration). |
+| **Whole site returns HTTP 522 right after deploying this Worker** | An existing site Worker route may have been replaced without a service binding, or the server is unreachable. Check `origin` in the health probe; bind the original route Worker when required. Custom Domain Workers can use native passthrough. |
 | `/llms.txt` returns origin's response | Worker route not bound to your domain. Complete STEP 1 (uncomment `routes`). Run `/__ooky/health` to confirm. |
 | `/__ooky/health` reports `served_on_workers_dev: true` | You're hitting the `*.workers.dev` URL - the `routes` block isn't wired. |
 | Manifest endpoint returns a loud 500 about `YOUR_DOMAIN` | `OOKY_DOMAIN` is still the placeholder. Set it in `wrangler.toml` and redeploy. |
@@ -241,10 +247,17 @@ Within ~30 seconds the integration in your Ooky dashboard should flip to
 ```bash
 npm install
 npm test                       # vitest unit tests
-npx wrangler deploy --dry-run  # validate the config without deploying
+npx wrangler deploy --config wrangler.toml --dry-run  # validate without deploying
 ```
 
 ## Changelog
+
+### 0.3.0
+
+Adds an explicit origin readiness probe at `/__ooky/health?check_origin=1`.
+Guided setup can distinguish working routes from a configured Worker whose
+origin fails. Failed origin services return a controlled 502 without replaying
+streamed mutations. Setup guidance now distinguishes Custom Domains from routes.
 
 ### 0.2.0
 

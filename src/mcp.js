@@ -67,20 +67,21 @@ export async function handleMcpJsonRpc(message, server) {
     return rpcError(null, INVALID_REQUEST, "Batch requests are not supported");
   }
   if (typeof message !== "object" || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
-    return rpcError(message?.id ?? null, INVALID_REQUEST, "Invalid JSON-RPC 2.0 request");
+    return rpcError(null, INVALID_REQUEST, "Invalid JSON-RPC 2.0 request");
   }
 
   const { id, method, params } = message;
-  const isNotification = id === undefined || id === null;
-
-  // Notifications get 202 Accepted with no body (streamable HTTP transport).
-  if (method.startsWith("notifications/")) {
-    return { status: 202, body: null };
+  const isNotification = !Object.prototype.hasOwnProperty.call(message, "id");
+  if (!isNotification && !(typeof id === "string" || (typeof id === "number" && Number.isFinite(id)))) {
+    return rpcError(null, INVALID_REQUEST, "Request id must be a string or number");
   }
-  if (isNotification) {
-    // Requests we'd have to answer but can't address - accept and drop.
-    return { status: 202, body: null };
+  if (params !== undefined && (!params || typeof params !== "object" || Array.isArray(params))) {
+    return rpcError(id ?? null, INVALID_PARAMS, "params must be an object");
   }
+  if (method.startsWith("notifications/") && !isNotification) {
+    return rpcError(id, INVALID_REQUEST, "Notifications must not include a request id");
+  }
+  if (isNotification) return { status: 202, body: null };
 
   try {
     switch (method) {
@@ -105,7 +106,11 @@ export async function handleMcpJsonRpc(message, server) {
         if (!server.tools.some((t) => t.name === name)) {
           return rpcError(id, INVALID_PARAMS, `Unknown tool: ${name}`);
         }
-        const data = await server.callTool(name, params?.arguments || {});
+        const args = params?.arguments;
+        if (args !== undefined && (!args || typeof args !== "object" || Array.isArray(args))) {
+          return rpcError(id, INVALID_PARAMS, "tools/call arguments must be an object");
+        }
+        const data = await server.callTool(name, args || {});
         return rpcResult(id, {
           content: [{ type: "text", text: JSON.stringify(data) }],
           isError: false,
@@ -226,9 +231,7 @@ export function filterBrandSection(manifest, section) {
  * otherwise offer ours (the client disconnects if that's unacceptable).
  */
 function negotiateVersion(requested) {
-  if (typeof requested === "string" && requested <= MCP_PROTOCOL_VERSION) {
-    return requested;
-  }
+  if (requested === MCP_PROTOCOL_VERSION) return requested;
   return MCP_PROTOCOL_VERSION;
 }
 

@@ -21,7 +21,7 @@ import { detectBot, getRegistry, isDistillableBot } from "./bots.js";
 import { detectAIReferral } from "./referrals.js";
 import { handleMcpInvocation, filterBrandSection, McpToolError } from "./mcp.js";
 
-const TEMPLATE_VERSION = "0.2.0";
+const TEMPLATE_VERSION = "0.3.1";
 const MAX_MCP_BODY_BYTES = 64 * 1024;
 
 // Placeholder value shipped in wrangler.toml. If it survives to runtime the
@@ -127,9 +127,23 @@ function isAssetPath(path) {
 
 // Empty/absent Accept counts as "wants HTML" (common for AI crawlers).
 function acceptWantsHtml(accept) {
-  const a = (typeof accept === "string" ? accept : "").toLowerCase();
-  if (a === "") return true;
-  return a.includes("text/html") || a.includes("*/*");
+  const value = (typeof accept === "string" ? accept : "").trim().toLowerCase();
+  if (!value) return true;
+  let bestSpecificity = -1;
+  let bestQuality = 0;
+  for (const range of value.split(",")) {
+    const [media, ...parameters] = range.split(";").map((part) => part.trim());
+    const specificity = media === "text/html" ? 2 : media === "text/*" ? 1 : media === "*/*" ? 0 : -1;
+    if (specificity < 0) continue;
+    const qualityParameter = parameters.find((parameter) => /^q\s*=/.test(parameter));
+    const quality = qualityParameter === undefined ? 1 : Number(qualityParameter.split("=")[1]);
+    const validQuality = Number.isFinite(quality) && quality >= 0 && quality <= 1 ? quality : 0;
+    if (specificity > bestSpecificity) {
+      bestSpecificity = specificity;
+      bestQuality = validQuality;
+    } else if (specificity === bestSpecificity) bestQuality = Math.max(bestQuality, validQuality);
+  }
+  return bestQuality > 0;
 }
 
 /**
@@ -356,7 +370,7 @@ function misconfiguredManifestResponse() {
  * dashboard reports a successful deploy. We can detect that the request host
  * isn't the configured domain and explain it instead of failing silently.
  */
-function healthResponse(url, env) {
+async function healthResponse(url, env) {
   const host = url.hostname;
   const onWorkersDev = host.endsWith(".workers.dev");
   const domainConfigured = isDomainConfigured(env);
@@ -411,6 +425,15 @@ function healthResponse(url, env) {
       : "Healthy: this Worker is bound to your domain and configured.",
   };
 
+  if (url.searchParams.get("check_origin") === "1" && hostMatchesDomain) {
+    report.origin = await checkOrigin(url, env);
+    if (!report.origin.reachable) {
+      report.ok = false;
+      report.problems.push("The website origin did not respond successfully. Check the existing site Worker or origin server before enabling this connection.");
+      report.next_steps = "Restore the website origin connection, then check again.";
+    }
+  }
+
   return new Response(JSON.stringify(report, null, 2), {
     status: report.ok ? 200 : 503,
     headers: {
@@ -419,6 +442,46 @@ function healthResponse(url, env) {
       "X-Ooky-Worker": "byo",
     },
   });
+}
+
+/** Explicit diagnostics exercise the same transport as real human traffic. */
+async function checkOrigin(url, env) {
+  const mode = env.ORIGIN_SERVICE ? "service" : "fetch";
+  const controller = new AbortController();
+  let timer;
+  let timedOut = false;
+  const probeUrl = new URL("/", url);
+  const request = new Request(probeUrl, {
+    method: "GET", redirect: "manual", signal: controller.signal,
+    headers: { "User-Agent": "Ooky-Connection-Check/1.0", Accept: "text/html" },
+  });
+  const operation = (async () => {
+    const response = await originFetch(request, env);
+    try {
+      let error;
+      if (response.status < 200 || response.status >= 400) error = "origin_http_error";
+      const location = response.headers.get("location");
+      if (response.status >= 300 && location) {
+        const target = new URL(location, probeUrl);
+        if (!response.headers.has("set-cookie") && target.origin === probeUrl.origin && target.pathname === "/" && !target.search && !target.hash) error = "origin_redirect_loop";
+      }
+      return { reachable: !error, status: response.status, mode, ...(error ? { error } : {}) };
+    } finally {
+      await response.body?.cancel();
+    }
+  })();
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => { timedOut = true; controller.abort(); reject(new Error("timeout")); }, 8000);
+      }),
+    ]);
+  } catch (_) {
+    return { reachable: false, status: null, mode, error: timedOut ? "origin_timeout" : "origin_unreachable" };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function recordEvent(env, payload) {
@@ -458,18 +521,28 @@ function recordEvent(env, payload) {
  * Normal case: the customer runs an origin server behind Cloudflare, so a plain
  * `fetch(request)` reaches it.
  *
- * But a site can also BE a Worker - Workers Static Assets, Pages, or any
- * Worker-served app. Those zones have no origin: their DNS record is a proxied
- * placeholder, and the site Worker answers the route. Binding this Worker to
- * that same route takes the route away from the site Worker (a route pattern
- * maps to exactly one script) and `fetch(request)` then goes looking for an
- * origin that does not exist - every request 522s.
+ * A site Worker on a Custom Domain is also reached by fetch(request). A site
+ * Worker on a ROUTE is different: replacing its route means native fetch no
+ * longer invokes it. That case requires a service binding to the site Worker.
  *
  * Bind ORIGIN_SERVICE to the site's Worker and we call it directly instead,
  * Worker-to-Worker, no origin involved. Unbound, behavior is unchanged.
  */
-function passthrough(request, env) {
+function originFetch(request, env) {
   return env.ORIGIN_SERVICE ? env.ORIGIN_SERVICE.fetch(request) : fetch(request);
+}
+
+async function passthrough(request, env) {
+  try {
+    return await originFetch(request, env);
+  } catch (_) {
+    // Never retry a streamed mutation or fall back to DNS when the configured
+    // site Worker fails: there may be no server behind that DNS record.
+    return new Response("The website origin is unavailable. Please check the origin connection in Ooky.", {
+      status: 502,
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Ooky-Origin-Error": "unreachable" },
+    });
+  }
 }
 
 export default {
