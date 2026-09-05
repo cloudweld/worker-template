@@ -69,19 +69,19 @@ OOKY_API_BASE = "https://api.ooky.ai/api"
 # binding = "OOKY_BOT_CACHE"
 # id = "REPLACE_ME"
 
-# ── Sites that have NO origin server ────────────────────────────────────────
-# Only needed if your site IS a Worker (Workers Static Assets, Pages, or any
-# Worker-served app) rather than a server behind Cloudflare.
+# ── Sites already served by a Worker ROUTE ─────────────────────────────────
+# Required when replacing an existing site's Worker route. A site Worker on a
+# Custom Domain is reachable through native fetch(request) without this binding.
 #
-# Those zones have no origin: the DNS record is a proxied placeholder and a
-# Worker answers the route. Because a route pattern maps to exactly ONE script,
+# Because a route pattern maps to exactly ONE script,
 # binding this Worker to that route takes the route away from your site's
 # Worker — and the normal origin passthrough then dials an origin that does not
 # exist, so every request returns HTTP 522.
 #
 # Bind ORIGIN_SERVICE to your site's Worker and passthrough goes Worker-to-Worker
 # instead. Leave it commented out if you have a real origin — nothing changes.
-# Confirm with: curl https://your-domain.com/__ooky/health  → origin_service_bound
+# Confirm with: curl 'https://your-domain.com/__ooky/health?check_origin=1'
+# origin.reachable must be true; origin.mode is service when this is bound.
 # [[services]]
 # binding = "ORIGIN_SERVICE"
 # service = "your-site-worker-name"
